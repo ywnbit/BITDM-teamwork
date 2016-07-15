@@ -1,0 +1,230 @@
+%读入数据%
+将处理好的TXT直接改后缀为CSV，然后用R执行以下语句：
+x1 <-as.xts(read.zoo("file:///Users/FishY/Downloads/SH600036.csv",header=T))
+
+%定义函数%
+T.ind <- function(quotes,tgt.margin=0.025,n.days=10){
+	v<-apply(HLC(quotes),1,mean)
+	r<-matrix(NA,ncol=n.days,nrow=NROW(quotes))
+	for (x in 1:n.days) r[,x] <- Next(Delt(Cl(quotes),v,k=x),x)
+	x<-apply(r,1,function(x) sum(x[x > tgt.margin | x < -tgt.margin]))
+	if (is.xts(quotes))
+	xts(x,time(quotes))
+	else x}
+
+%画K线图%
+candleChart(last(x1,"3 months"),theme="white",TA=NULL)
+avgPrice <- function(p) {
+apply(HLC(p),1,mean)}
+addAvgPrice <- newTA(FUN=avgPrice,col=1,legend="AvgPrice")
+addT.ind <- newTA(FUN=T.ind,col="red",legend="tgtRet")
+addAvgPrice(on=1)
+addT.ind()
+
+%技术指标%
+myATR <- function(x) ATR(HLC(x))[,'atr']
+mySMI <- function(x) SMI(HLC(x))[,'SMI']
+myADX <- function(x) ADX(HLC(x))[,'ADX']
+myAroon <- function(x) aroon(x[,c('High','Low')])$oscillator
+myBB <- function(x) BBands(HLC(x))[,'pctB']
+myChaikinVol <- function(x) Delt(chaikinVolatility(x[,c("High","Low")]))[,1]
+myCLV <- function(x) EMA(CLV(HLC(x)))[,1]
+myEMV <- function(x) EMV(x[,c('High','Low')],x[,'Volume'])[,2]
+myMACD <- function(x) MACD(Cl(x))[,2]
+myMFI <- function(x) MFI(x[,c("High","Low","Close")], x[,"Volume"])
+mySAR <- function(x) SAR(x[,c('High','Close')]) [,1]
+myVolat <- function(x) volatility(OHLC(x),calc="garman")[,1]
+
+%随机森林建模%
+data.model <- specifyModel(T.ind(x1) ~ Delt(Cl(x1),k=1:10) + 
+       myATR(x1) + mySMI(x1) + myADX(x1) + myAroon(x1) + 
+       myBB(x1)  + myChaikinVol(x1) + myCLV(x1) + 
+       CMO(Cl(x1)) + EMA(Delt(Cl(x1))) + myEMV(x1) + 
+       myVolat(x1)  + myMACD(x1) + myMFI(x1) + RSI(Cl(x1)) +
+       mySAR(x1) + runMean(Cl(x1)) + runSD(Cl(x1)))
+set.seed(1234)
+rf <- buildModel(data.model,method='randomForest',
+             training.per=c(start(x1),index(x1["2015-02-25"])),
+             ntree=50, importance=T)
+			 
+
+%查看随机森林计算出的变量重要性%
+varImpPlot(rf@fitted.model,type=1)
+
+%筛选大于阈值的变量%
+imp <- importance(rf@fitted.model,type=1)
+ rownames(imp)[which(imp > 5)]
+ 
+ 运行结果：
+[1] "myATR.x1"      "myVolat.x1"    "mySAR.x1"      "runMean.Cl.x1"
+
+%根据结果重写模型表达式%
+data.model <- specifyModel(T.ind(x1) ~ myATR(x1) + myVolat(x1) + mySAR(x1) + runMean(Cl(x1)))
+
+%数据用于模型训练%
+Tdata.train <- as.data.frame(modelData(data.model,
+                       data.window=c('2013-01-07','2016-06-13')))
+Tform <- as.formula('T.ind.x1 ~ .')
+
+%使用SVM建模%
+回归问题：
+library(e1071)
+sv <- svm(Tform,Tdata.train[1:495,],gamma=0.001,cost=100)
+s.preds <- predict(sv,Tdata.train[496:990,])
+sigs.svm <- trading.signals(s.preds,0.1,-0.1)
+true.sigs <- trading.signals(Tdata.train[496:990,'T.ind.x1'],0.1,-0.1)
+sigs.PR(sigs.svm,true.sigs)
+
+运行结果：
+    precision recall
+s   0.3636364 0.2739726
+b         NaN 0.0000000
+s+b 0.3636364 0.1204819
+
+%使用人工神经网络建模%
+回归问题：
+set.seed(1234)
+library(nnet)
+norm.data <- scale(Tdata.train)
+nn <- nnet(Tform,norm.data[1:495,],size=10,decay=0.01,maxit=1000,linout=T,trace=F)
+norm.preds <- predict(nn,norm.data[496:990,])
+preds <- unscale(norm.preds,norm.data)
+sigs.nn <- trading.signals(preds,0.1,-0.1)
+true.sigs <- trading.signals(Tdata.train[496:990,'T.ind.x1'],0.1,-0.1)
+sigs.PR(sigs.nn,true.sigs)
+
+运行结果：
+    precision    recall
+s   0.2269504 0.3440860
+b   0.2187500 0.1308411
+s+b 0.2243902 0.2300000
+
+
+
+ %交易策略%
+policy.1 <- function(signals,market,opened.pos,money,
+                     bet=0.2,exp.prof=0.025, max.loss= 0.05
+                    )
+  {
+    d <- NROW(market) # this is the ID of today
+    orders <- NULL
+    nOs <- NROW(opened.pos)
+    # nothing to do!
+    if (!nOs && signals[d] == 'h') return(orders)
+
+    # First lets check if we can open new positions
+    # i) long positions
+    if (signals[d] == 'b') {
+      quant <- round(bet*money/market[d,'Close'],0)
+      if (quant > 0) 
+        orders <- rbind(orders,
+              data.frame(order=c(1,-1,-1),order.type=c(1,2,3), 
+                         val = c(quant,
+                                 market[d,'Close']*(1+exp.prof),
+                                 market[d,'Close']*(1-max.loss)
+                                ),
+                         action = c('open','close','close'),
+                         posID = c(NA,NA,NA)
+                        )
+                       )
+
+    # ii) short positions  
+    } else if (signals[d] == 's') {
+      # this is the money already committed to buy stocks
+      # because of currently opened short positions
+      need2buy <- sum(opened.pos[opened.pos[,'pos.type']==-1,
+                                 "N.stocks"])*market[d,'Close']
+      quant <- round(bet*(money-need2buy)/market[d,'Close'],0)
+      if (quant > 0)
+        orders <- rbind(orders,
+              data.frame(order=c(-1,1,1),order.type=c(1,2,3), 
+                         val = c(quant,
+                                 market[d,'Close']*(1-exp.prof),
+                                 market[d,'Close']*(1+max.loss)
+                                ),
+                         action = c('open','close','close'),
+                         posID = c(NA,NA,NA)
+                        )
+                       )
+    }
+
+    orders
+  }
+
+**********************************************************
+%模拟交易%
+
+# Train and test periods
+start <- 1
+len.tr <- 446
+len.ts <- 445
+tr <- start:(start+len.tr-1)
+ts <- (start+len.tr):(start+len.tr+len.ts-1)
+
+date <- rownames(Tdata.train[start+len.tr,])
+market <- x1[paste(date,'/',sep='')][1:len.ts]
+
+set.seed(1234)
+library(nnet)
+norm.data <- scale(Tdata.train)
+nn <- nnet(Tform,norm.data[tr,],size=10,decay=0.01,maxit=1000,linout=T,trace=F)
+p <- predict(nn,norm.data[ts,])
+preds <- unscale(p,norm.data)
+sig <- trading.signals(preds,0.1,-0.1)
+
+t <- trading.simulator(market,sig,'policy.1',list(exp.prof=0.05,bet=0.3))
+Borrowing money ( 38179.5 ) for closing a short position (PosID= 60 )
+Borrowing money ( 251794.5 ) for closing a short position (PosID= 56 )
+Borrowing money ( 465942.2 ) for closing a short position (PosID= 57 )
+Borrowing money ( 187357.1 ) for closing a short position (PosID= 191 )
+Borrowing money ( 5320.711 ) for closing a short position (PosID= 215 )
+Borrowing money ( 155442.9 ) for closing a short position (PosID= 216 )
+Borrowing money ( 303298.6 ) for closing a short position (PosID= 217 )
+Borrowing money ( 450388.6 ) for closing a short position (PosID= 218 )
+Borrowing money ( 3155.34 ) for closing a short position (PosID= 209 )
+Borrowing money ( 42669.73 ) for closing a short position (PosID= 243 )
+
+t
+结果：
+Object of class tradeRecord with slots:
+
+	 trading: <xts object with a numeric  445 x 5  matrix>
+	 positions: <numeric  56 x 7  matrix>
+	 init.cap :  1e+06 
+	 trans.cost :  5 
+	 policy.func :  policy.1 
+	 policy.pars : <list with  3  elements>
+summary(t)
+结果：
+== Summary of a Trading Simulation with  445  days ==
+
+Trading policy function :  policy.1
+Policy function parameters:
+	 exp.prof  =  0.05 
+	 bet  =  0.3 
+
+Transaction costs :  5 
+Initial Equity    :  1e+06 
+Final Equity      :  809569.9   Return :  75.14 %
+Number of trading positions:  319 
+
+Use function "tradingEvaluation()" for further stats on this simulation.
+
+ tradingEvaluation(t)
+ 结果：
+    NTrades       NProf    PercProf          PL         Ret   RetOverBH       MaxDD SharpeRatio     AvgProf 
+     319.00      163.00       51.10        -190430.05      75.14    -31.41   563547.15       -0.02        4.99 
+    AvgLoss       AvgPL     MaxProf     MaxLoss 
+      -4.77        0.22        7.12       -8.29 
+%绘图%
+plot(t,market,theme='white',name='SH600036')
+Rentability =  75.14301 %
+
+%数据包%
+DMwR——教材数据包Data Mining with R
+quantmod——画K线图
+xts——创建时间序列数据
+TTR——技术指标集合
+randomForest——使用随机森林建模
+e1071、kernlab——使用SVM建模
+nnet——使用人工神经网络建模
